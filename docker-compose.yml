@@ -1,0 +1,167 @@
+version: "3.9"
+
+# BlackRoad Agent Services
+# ========================
+# Multi-service deployment for BlackRoad agent infrastructure
+
+services:
+  # ==========================================================================
+  # Core Agent API
+  # ==========================================================================
+  agent-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: blackroad/agent-api:latest
+    container_name: blackroad-agent-api
+    ports:
+      - "8000:8000"
+    environment:
+      - AGENT_AUTH_TOKEN=${AGENT_AUTH_TOKEN:-}
+      - JETSON_HOST=${JETSON_HOST:-jetson.local}
+      - JETSON_USER=${JETSON_USER:-jetson}
+      - BLACKROAD_CONFIG=/app/config/config.yaml
+      - BLACKROAD_JOBS_DB=/app/data/jobs.db
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - agent-config:/app/config
+      - agent-data:/app/data
+      - agent-models:/var/lib/blackroad/models
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - blackroad-net
+
+  # ==========================================================================
+  # Redis Cache
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: blackroad-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - blackroad-net
+
+  # ==========================================================================
+  # CeCe Dynamic Planner
+  # ==========================================================================
+  cece-planner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: blackroad/cece-planner:latest
+    container_name: blackroad-cece
+    command: ["python", "-m", "cece.dynamic_planner"]
+    environment:
+      - BLACKROAD_CONFIG=/app/config/config.yaml
+      - REDIS_URL=redis://redis:6379/0
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+    volumes:
+      - agent-config:/app/config
+      - cece-data:/app/cece-data
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - blackroad-net
+
+  # ==========================================================================
+  # Integration Services
+  # ==========================================================================
+
+  # Cloudflare Tunnel (optional - for exposing services)
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: blackroad-cloudflared
+    command: tunnel run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-}
+    profiles:
+      - tunnels
+    restart: unless-stopped
+    networks:
+      - blackroad-net
+
+  # ==========================================================================
+  # Monitoring & Observability (optional)
+  # ==========================================================================
+
+  # Prometheus metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: blackroad-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    profiles:
+      - monitoring
+    restart: unless-stopped
+    networks:
+      - blackroad-net
+
+  # Grafana dashboards
+  grafana:
+    image: grafana/grafana:latest
+    container_name: blackroad-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    profiles:
+      - monitoring
+    restart: unless-stopped
+    networks:
+      - blackroad-net
+
+# ==========================================================================
+# Volumes
+# ==========================================================================
+volumes:
+  agent-config:
+    name: blackroad-agent-config
+  agent-data:
+    name: blackroad-agent-data
+  agent-models:
+    name: blackroad-agent-models
+  redis-data:
+    name: blackroad-redis-data
+  cece-data:
+    name: blackroad-cece-data
+  prometheus-data:
+    name: blackroad-prometheus-data
+  grafana-data:
+    name: blackroad-grafana-data
+
+# ==========================================================================
+# Networks
+# ==========================================================================
+networks:
+  blackroad-net:
+    name: blackroad-network
+    driver: bridge

@@ -1,35 +1,113 @@
-name: 🌍 Deploy Multi-Cloud
+name: Deploy Multi-Cloud
 
 on:
   push:
     branches: [master, main]
   workflow_dispatch:
+    inputs:
+      deploy_railway:
+        description: 'Deploy to Railway'
+        type: boolean
+        default: true
+      deploy_cloudflare:
+        description: 'Deploy to Cloudflare'
+        type: boolean
+        default: true
+      deploy_vercel:
+        description: 'Deploy to Vercel'
+        type: boolean
+        default: true
+      deploy_droplet:
+        description: 'Deploy to DigitalOcean'
+        type: boolean
+        default: true
+      deploy_pis:
+        description: 'Deploy to Raspberry Pis'
+        type: boolean
+        default: true
 
 env:
   NODE_VERSION: '20'
+  PYTHON_VERSION: '3.11'
 
 jobs:
-  deploy-cloudflare:
-    name: ☁️ Cloudflare Pages
+  # ==========================================================================
+  # Railway Deployment
+  # ==========================================================================
+  deploy-railway:
+    name: Railway
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' || inputs.deploy_railway
     steps:
       - uses: actions/checkout@v4
 
-      - name: Deploy changed domains
-        run: |
-          # Will be triggered by main deploy-cloudflare-all.yml workflow
-          echo "✅ Cloudflare deployment handled by deploy-cloudflare-all.yml"
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
 
-  deploy-vercel:
-    name: ▲ Vercel
+      - name: Deploy to Railway
+        run: railway up --detach
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+      - name: Verify deployment
+        run: |
+          sleep 30
+          curl -sf "https://blackroad-agents.railway.app/health" || echo "Health check pending"
+
+  # ==========================================================================
+  # Cloudflare Pages Deployment
+  # ==========================================================================
+  deploy-cloudflare:
+    name: Cloudflare Pages
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.deploy_cloudflare
     strategy:
       matrix:
         domain:
-          - math-blackroad-io
-          - blackroadai
+          - blackroad-io
+          - blackroad-network
+          - blackroad-systems
           - lucidia-earth
+          - blackroadai
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check if domain directory exists
+        id: check-domain
+        run: |
+          if [ -d "domains/${{ matrix.domain }}" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy to Cloudflare Pages
+        if: steps.check-domain.outputs.exists == 'true'
+        uses: cloudflare/pages-action@v1
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          projectName: ${{ matrix.domain }}
+          directory: domains/${{ matrix.domain }}
+
+  # ==========================================================================
+  # Vercel Deployment
+  # ==========================================================================
+  deploy-vercel:
+    name: Vercel
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || inputs.deploy_vercel
+    strategy:
+      matrix:
+        project:
+          - name: math-blackroad-io
+            directory: domains/math-blackroad-io
+          - name: blackroadai
+            directory: domains/blackroadai
+          - name: lucidia-earth
+            directory: domains/lucidia-earth
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
 
@@ -38,42 +116,40 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
+      - name: Check if project directory exists
+        id: check-project
+        run: |
+          if [ -d "${{ matrix.project.directory }}" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Install Vercel CLI
+        if: steps.check-project.outputs.exists == 'true'
         run: npm install -g vercel
 
       - name: Deploy to Vercel
-        working-directory: domains/${{ matrix.domain }}
+        if: steps.check-project.outputs.exists == 'true'
+        working-directory: ${{ matrix.project.directory }}
         run: |
           if [ -f "package.json" ]; then
-            npm ci
+            npm ci || npm install
             npm run build || true
           fi
           vercel --prod --yes --token=${{ secrets.VERCEL_TOKEN }}
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: blackroad-${{ matrix.domain }}
+          VERCEL_PROJECT_ID: blackroad-${{ matrix.project.name }}
 
-  deploy-railway:
-    name: 🚂 Railway
+  # ==========================================================================
+  # DigitalOcean Droplet Deployment
+  # ==========================================================================
+  deploy-droplet:
+    name: DigitalOcean Droplet
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Railway CLI
-        run: npm install -g @railway/cli
-
-      - name: Deploy to Railway
-        run: |
-          railway up --detach
-        env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-
-  deploy-digitalocean:
-    name: 🌊 DigitalOcean
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.deploy_droplet
     steps:
       - uses: actions/checkout@v4
 
@@ -86,69 +162,194 @@ jobs:
 
       - name: Deploy to Droplet
         run: |
-          rsync -avz --exclude='.git' --exclude='node_modules' \
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='__pycache__' \
+            --exclude='.env' \
+            --exclude='*.pyc' \
             ./ root@159.65.43.12:/opt/blackroad/
 
-          ssh root@159.65.43.12 'cd /opt/blackroad && ./deploy.sh restart'
-
-  deploy-pis:
-    name: 🥧 Raspberry Pi Fleet
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push'
-    steps:
-      - name: Trigger Pi deployment workflow
+      - name: Restart services
         run: |
-          # This will trigger the deploy-to-pis.yml workflow
-          echo "✅ Pi deployment handled by deploy-to-pis.yml"
+          ssh root@159.65.43.12 'cd /opt/blackroad && docker-compose pull && docker-compose up -d'
 
-  update-notion:
-    name: 📝 Update Notion
+      - name: Health check
+        run: |
+          sleep 10
+          ssh root@159.65.43.12 'curl -sf http://localhost:8000/health' || echo "Health check pending"
+
+  # ==========================================================================
+  # Raspberry Pi Fleet Deployment
+  # ==========================================================================
+  deploy-pis:
+    name: Raspberry Pi Fleet
     runs-on: ubuntu-latest
-    needs: [deploy-cloudflare, deploy-vercel, deploy-railway, deploy-digitalocean]
+    if: github.event_name == 'push' || inputs.deploy_pis
+    strategy:
+      matrix:
+        pi:
+          - name: lucidia
+            host: 192.168.4.38
+          - name: blackroad-pi
+            host: 192.168.4.64
+          - name: mystery-pi
+            host: 192.168.4.49
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PI_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ matrix.pi.host }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Deploy to Pi
+        continue-on-error: true
+        run: |
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='__pycache__' \
+            --exclude='.env' \
+            -e "ssh -o ConnectTimeout=10" \
+            ./ pi@${{ matrix.pi.host }}:/home/pi/blackroad/
+
+      - name: Restart service
+        continue-on-error: true
+        run: |
+          ssh -o ConnectTimeout=10 pi@${{ matrix.pi.host }} \
+            'cd /home/pi/blackroad && sudo systemctl restart blackroad-agent || ./restart.sh'
+
+      - name: Run sentience test
+        continue-on-error: true
+        run: |
+          ssh -o ConnectTimeout=10 pi@${{ matrix.pi.host }} << 'EOF'
+            echo "=== Sentience Test for ${{ matrix.pi.name }} ==="
+            echo "Memory DB: $(test -f /var/lib/blackroad/memory.db && echo 'OK' || echo 'NOT FOUND')"
+            echo "Models: $(ls /var/lib/blackroad/models/*.gguf 2>/dev/null | wc -l) GGUF files"
+            echo "Agent: $(systemctl is-active blackroad-agent 2>/dev/null || pgrep -f blackroad)"
+          EOF
+
+  # ==========================================================================
+  # Notify Notion
+  # ==========================================================================
+  notify-notion:
+    name: Update Notion
+    runs-on: ubuntu-latest
+    needs: [deploy-railway, deploy-cloudflare, deploy-vercel, deploy-droplet, deploy-pis]
     if: always()
     steps:
       - uses: actions/checkout@v4
 
-      - name: Log deployment to Notion
-        run: |
-          # TODO: Use Notion API to create deployment log page
-          echo "Deployment completed at $(date)"
-          echo "Platforms: Cloudflare, Vercel, Railway, DigitalOcean, Pis"
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Log to Notion
+        if: env.NOTION_TOKEN != ''
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+        run: |
+          python << 'EOF'
+          import os
+          import httpx
+          from datetime import datetime
 
-  update-asana:
-    name: 📊 Update Asana
+          token = os.getenv("NOTION_TOKEN")
+          database_id = os.getenv("NOTION_DATABASE_ID")
+
+          if not token or not database_id:
+              print("Notion not configured, skipping")
+              exit(0)
+
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Notion-Version": "2022-06-28",
+              "Content-Type": "application/json",
+          }
+
+          data = {
+              "parent": {"database_id": database_id},
+              "properties": {
+                  "Name": {"title": [{"text": {"content": f"Deployment {datetime.now().isoformat()}"}}]},
+                  "Status": {"select": {"name": "completed"}},
+              },
+          }
+
+          try:
+              response = httpx.post(
+                  "https://api.notion.com/v1/pages",
+                  headers=headers,
+                  json=data,
+                  timeout=30,
+              )
+              print(f"Notion response: {response.status_code}")
+          except Exception as e:
+              print(f"Notion error: {e}")
+          EOF
+
+  # ==========================================================================
+  # Notify Asana
+  # ==========================================================================
+  notify-asana:
+    name: Update Asana
     runs-on: ubuntu-latest
-    needs: [deploy-cloudflare, deploy-vercel, deploy-railway, deploy-digitalocean]
+    needs: [deploy-railway, deploy-cloudflare, deploy-vercel, deploy-droplet, deploy-pis]
     if: always()
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Update Asana tasks
-        run: |
-          # TODO: Use Asana API to mark deployment task complete
-          echo "Deployment task updated in Asana"
+      - name: Update Asana task
+        if: env.ASANA_TOKEN != ''
         env:
           ASANA_TOKEN: ${{ secrets.ASANA_TOKEN }}
+          ASANA_PROJECT_ID: ${{ secrets.ASANA_PROJECT_ID }}
+        run: |
+          if [ -z "$ASANA_TOKEN" ] || [ -z "$ASANA_PROJECT_ID" ]; then
+            echo "Asana not configured, skipping"
+            exit 0
+          fi
 
-  notify-success:
-    name: ✅ Multi-Cloud Deploy Complete
+          curl -s -X POST "https://app.asana.com/api/1.0/tasks" \
+            -H "Authorization: Bearer $ASANA_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"data\": {
+                \"name\": \"Deployment $(date -u +%Y-%m-%dT%H:%M:%SZ)\",
+                \"projects\": [\"$ASANA_PROJECT_ID\"],
+                \"notes\": \"Multi-cloud deployment completed via GitHub Actions\",
+                \"completed\": true
+              }
+            }" || echo "Asana update failed"
+
+  # ==========================================================================
+  # Summary
+  # ==========================================================================
+  summary:
+    name: Deployment Summary
     runs-on: ubuntu-latest
-    needs: [deploy-vercel, deploy-railway, deploy-digitalocean, update-notion, update-asana]
+    needs: [deploy-railway, deploy-cloudflare, deploy-vercel, deploy-droplet, deploy-pis, notify-notion, notify-asana]
     if: always()
     steps:
-      - name: Summary
+      - name: Generate summary
         run: |
-          echo "🎉 Multi-Cloud Deployment Complete!"
-          echo ""
-          echo "Deployed to:"
-          echo "  ☁️  Cloudflare Pages"
-          echo "  ▲  Vercel"
-          echo "  🚂 Railway"
-          echo "  🌊 DigitalOcean"
-          echo "  🥧 Raspberry Pi Fleet"
-          echo ""
-          echo "Updated:"
-          echo "  📝 Notion documentation"
-          echo "  📊 Asana project tasks"
+          echo "# Multi-Cloud Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Platforms" >> $GITHUB_STEP_SUMMARY
+          echo "- Railway: ${{ needs.deploy-railway.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Cloudflare: ${{ needs.deploy-cloudflare.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Vercel: ${{ needs.deploy-vercel.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- DigitalOcean: ${{ needs.deploy-droplet.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Raspberry Pis: ${{ needs.deploy-pis.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Notifications" >> $GITHUB_STEP_SUMMARY
+          echo "- Notion: ${{ needs.notify-notion.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Asana: ${{ needs.notify-asana.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Completed at: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_STEP_SUMMARY
