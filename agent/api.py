@@ -1,126 +1,134 @@
-"""FastAPI application exposing the BlackRoad agent API."""
+"""FastAPI application exposing the BlackRoad agent API.
+
+This module provides a unified API surface for:
+- Health checks and status monitoring
+- Telemetry collection (local and remote)
+- Job execution on remote hosts
+- Device flashing capabilities
+- Model inference endpoints
+- Audio transcription
+- WebSocket streaming for real-time updates
+"""
 from __future__ import annotations
 
-from typing import Any, Dict
-
-from fastapi import FastAPI
-
-from agent.auth import TokenAuthMiddleware
-from agent.config import auth_token as get_auth_token
-from agent.config import load as load_cfg
-from agent.config import save as save_cfg
-
-app = FastAPI(title="BlackRoad Agent API", version="1.0.0")
-app.add_middleware(TokenAuthMiddleware)
-
-
-@app.get("/healthz")
-def healthcheck() -> Dict[str, Any]:
-    """Return a minimal health payload."""
-    return {"ok": True, "auth": bool(get_auth_token())}
-
-
-@app.get("/settings")
-def read_settings() -> Dict[str, Any]:
-    """Return the current configuration."""
-    return load_cfg()
-
-
-@app.post("/settings/auth")
-def set_auth_token(payload: Dict[str, Any] | None) -> Dict[str, Any]:
-    """Persist a new shared authentication token."""
-    token = (payload or {}).get("token", "")
-    if token is None:
-        token = ""
-    token = str(token).strip()
-    cfg = load_cfg()
-    cfg.setdefault("auth", {})["token"] = token
-    save_cfg(cfg)
-    return {"ok": True, "enabled": bool(token)}
-"""FastAPI surface for the BlackRoad device dashboard."""
-"""FastAPI application exposing BlackRoad agent endpoints."""
-"""FastAPI app exposing BlackRoad device agent endpoints."""
-
-from __future__ import annotations
-
-from pathlib import Path
-from typing import Any, Dict
-
-from fastapi import Body, FastAPI, Request
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
-
-from agent import discover
-from agent.config import DEFAULT_USER, active_target, set_target
-
-app = FastAPI(title="BlackRoad Device Agent")
-
-templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
-
-
-@app.get("/", response_class=HTMLResponse)
-def dashboard(request: Request) -> HTMLResponse:
-from fastapi import FastAPI, Request
-from fastapi.templating import Jinja2Templates
-
-from agent import discover
-from agent.config import active_target, set_target
-
-app = FastAPI(title="BlackRoad Agent", docs_url="/_docs")
-_templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent / "templates"))
-
-
-@app.get("/")
-def dashboard(request: Request):
-    """Serve the dashboard template."""
-    context: Dict[str, Any] = {
-        "request": request,
-        "target": active_target(),
-    }
-    return templates.TemplateResponse("dashboard.html", context)
-
-
-@app.get("/discover/scan")
-def discover_scan() -> Dict[str, Any]:
-    return _templates.TemplateResponse("dashboard.html", context)
-
-
-@app.get("/discover/scan")
-def discover_scan():
-    return discover.scan()
-
-
-@app.post("/discover/set")
-def discover_set(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-    host = payload.get("host")
-    user = payload.get("user", DEFAULT_USER)
-    if not host:
-        return {"ok": False, "error": "host required"}
-    try:
-        set_target(host, user)
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
-    except OSError as exc:
-        return {"ok": False, "error": str(exc)}
-    except Exception:
-        return {"ok": False, "error": "failed to update target"}
-def discover_set(j: Dict[str, Any]):
-    host = j.get("host")
-    user = j.get("user", "jetson")
-"""FastAPI application exposing BlackRoad agent controls."""
-from __future__ import annotations
-
+import asyncio
+import contextlib
 import json
+import os
 import pathlib
 import subprocess
-from typing import Any, Dict
+import tempfile
+import threading
+from pathlib import Path
+from typing import Any, Dict, Optional
 
-from fastapi import Body, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Body,
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
+from starlette.websockets import WebSocketState
 
-from agent import flash, jobs, telemetry
-from agent.config import active_target, load as load_cfg, set_target
+from agent import flash, jobs, models, telemetry, transcribe
+from agent.auth import TokenAuthMiddleware
+from agent.config import (
+    DEFAULT_USER,
+    active_target,
+    auth_token as get_auth_token,
+    load as load_cfg,
+    save as save_cfg,
+    set_target,
+)
 
-app = FastAPI(title="BlackRoad Agent")
+# Environment configuration
+JETSON_HOST = os.getenv("JETSON_HOST", "jetson.local")
+JETSON_USER = os.getenv("JETSON_USER", "jetson")
+AUTH_TOKEN = os.getenv("AGENT_AUTH_TOKEN", "")
+
+# FastAPI application
+app = FastAPI(
+    title="BlackRoad Agent API",
+    version="1.0.0",
+    description="Unified API for BlackRoad agent services",
+    docs_url="/_docs",
+    redoc_url="/_redoc",
+)
+
+# Add authentication middleware
+app.add_middleware(TokenAuthMiddleware)
+
+# Templates for dashboard
+templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+
+# Known OS images for flashing
+KNOWN_IMAGES = [
+    {
+        "name": "Raspberry Pi OS Lite (arm64)",
+        "url": "https://downloads.raspberrypi.com/raspios_lite_arm64_latest",
+    },
+    {
+        "name": "Ubuntu Server 24.04 (RPI arm64)",
+        "url": "https://cdimage.ubuntu.com/releases/24.04/release/ubuntu-24.04.1-preinstalled-server-arm64+raspi.img.xz",
+    },
+    {
+        "name": "BlackRoad OS (latest)",
+        "url": "https://releases.blackroad.io/os/latest.img.xz",
+        "sha256": "https://releases.blackroad.io/os/latest.sha256",
+    },
+]
+
+
+# ==============================================================================
+# Request/Response Models
+# ==============================================================================
+
+
+class JobRequest(BaseModel):
+    """Request model for job execution."""
+    command: str
+    host: Optional[str] = None
+    user: Optional[str] = None
+
+
+class JetsonSettings(BaseModel):
+    """Settings for Jetson target configuration."""
+    host: str
+    user: str = "jetson"
+
+
+# ==============================================================================
+# Authentication Helpers
+# ==============================================================================
+
+
+def require_bearer_token(authorization: str = Header(default="")) -> None:
+    """Validate bearer token authentication."""
+    if not AUTH_TOKEN:
+        return  # No token configured, allow all
+
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or token != AUTH_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+# ==============================================================================
+# WebSocket Connection Manager
+# ==============================================================================
 
 
 class ConnectionManager:
@@ -147,249 +155,339 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-@app.websocket("/ws/logs")
-async def logs_websocket(websocket: WebSocket) -> None:
-    """Simple echo socket that allows clients to keep an open channel."""
-    await manager.connect(websocket)
+# ==============================================================================
+# Health & Status Endpoints
+# ==============================================================================
+
+
+@app.get("/health")
+@app.get("/healthz")
+def healthcheck() -> Dict[str, Any]:
+    """Return a minimal health payload for load balancers."""
+    return {
+        "ok": True,
+        "service": "blackroad-agent",
+        "auth_enabled": bool(get_auth_token()),
+    }
+
+
+@app.get("/status")
+def get_status(_: None = Depends(require_bearer_token)) -> Dict[str, Any]:
+    """Return comprehensive status with telemetry."""
     try:
-        while True:
-            try:
-                payload = await websocket.receive_text()
-            except RuntimeError:
-                break
-            await manager.broadcast(json.dumps({"echo": payload}))
-    except WebSocketDisconnect:
-        pass
-    finally:
-        manager.disconnect(websocket)
+        pi_telemetry = telemetry.collect_local()
+    except Exception as exc:
+        pi_telemetry = {"status": "error", "detail": str(exc)}
+
+    try:
+        jetson_telemetry = telemetry.collect_remote(JETSON_HOST, user=JETSON_USER)
+    except Exception as exc:
+        jetson_telemetry = {"status": "error", "detail": str(exc)}
+
+    return {
+        "ok": True,
+        "target": {"host": JETSON_HOST, "user": JETSON_USER},
+        "pi": pi_telemetry,
+        "jetson": jetson_telemetry,
+    }
+
+
+# ==============================================================================
+# Dashboard Endpoints
+# ==============================================================================
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard(request: Request) -> HTMLResponse:
+    """Serve the dashboard UI."""
+    context: Dict[str, Any] = {
+        "request": request,
+        "target": active_target(),
+    }
+    try:
+        return templates.TemplateResponse("dashboard.html", context)
+    except Exception:
+        return HTMLResponse("<h1>BlackRoad Agent</h1><p>Dashboard unavailable</p>")
+
+
+# ==============================================================================
+# Settings Endpoints
+# ==============================================================================
 
 
 @app.get("/settings")
 def get_settings() -> Dict[str, Any]:
-    """Return the active Jetson settings and raw configuration."""
+    """Return the active configuration."""
     host, user = active_target()
-    return {"jetson": {"host": host, "user": user}, "raw": load_cfg()}
+    return {
+        "jetson": {"host": host, "user": user},
+        "raw": load_cfg(),
+    }
+
+
+@app.post("/settings/auth")
+def set_auth_token(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Persist a new shared authentication token."""
+    token = (payload or {}).get("token", "")
+    if token is None:
+        token = ""
+    token = str(token).strip()
+    cfg = load_cfg()
+    cfg.setdefault("auth", {})["token"] = token
+    save_cfg(cfg)
+    return {"ok": True, "enabled": bool(token)}
 
 
 @app.post("/settings/jetson")
-def set_jetson(jetson: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-    host = (jetson or {}).get("host")
-    user = (jetson or {}).get("user", "jetson")
-    if not host:
+def set_jetson_settings(settings: JetsonSettings) -> Dict[str, Any]:
+    """Update the Jetson target configuration."""
+    if not settings.host:
         return {"ok": False, "error": "host required"}
-    set_target(host, user)
-    return {"ok": True, "jetson": {"host": host, "user": user}}
+    set_target(settings.host, settings.user)
+    return {"ok": True, "jetson": {"host": settings.host, "user": settings.user}}
+
+
+# ==============================================================================
+# Discovery Endpoints
+# ==============================================================================
 
 
 @app.get("/discover/target")
-def get_target() -> Dict[str, Any]:
-def discover_target():
+def discover_target() -> Dict[str, Any]:
+    """Get the current target configuration."""
     target = active_target()
     if not target:
         return {"ok": False, "jetson": None}
-    return {"ok": True, "jetson": target}
+    return {"ok": True, "jetson": {"host": target[0], "user": target[1]}}
 
 
-__all__ = ["app"]
-from fastapi import FastAPI, HTTPException
-import os
-from fastapi import Depends, FastAPI, Header, HTTPException, status
-from pydantic import BaseModel
-import uvicorn
-from agent import telemetry, jobs
-
-app = FastAPI(title="BlackRoad API")
-
-JETSON_HOST = "jetson.local"
-JETSON_USER = "jetson"
+@app.get("/discover/scan")
+def discover_scan() -> Dict[str, Any]:
+    """Scan for available devices on the network."""
+    from agent import discover
+    return discover.scan()
 
 
-class JobRequest(BaseModel):
-    command: str
+@app.post("/discover/set")
+def discover_set(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Set the target device for operations."""
+    host = payload.get("host")
+    user = payload.get("user", DEFAULT_USER)
+    if not host:
+        return {"ok": False, "error": "host required"}
+    try:
+        set_target(host, user)
+        return {"ok": True, "target": {"host": host, "user": user}}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
 
 
-@app.get("/status")
-def status():
-    """Return telemetry for Pi and Jetson."""
+# ==============================================================================
+# Telemetry Endpoints
+# ==============================================================================
+
+
+@app.get("/telemetry/local")
+def telemetry_local() -> Dict[str, Any]:
+    """Expose local telemetry for the dashboard."""
+    return telemetry.collect_local()
+
+
+@app.get("/telemetry/remote")
+def telemetry_remote(host: Optional[str] = None, user: Optional[str] = None) -> Dict[str, Any]:
+    """Expose remote telemetry, allowing overrides via query parameters."""
+    return telemetry.collect_remote(host=host, user=user)
+
+
+@app.get("/connect/test")
+def connect_test() -> Dict[str, Any]:
+    """Attempt to gather telemetry from both Pi and Jetson."""
     try:
         pi = telemetry.collect_local()
-    except telemetry.TelemetryError as exc:
-        pi = {"status": "error", "detail": str(exc)}
+        jetson = telemetry.collect_remote()
+        ok = all(not str(value).startswith("error") for value in jetson.values())
+        return {"ok": ok, "pi": pi, "jetson": jetson}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
-    try:
-        jetson = telemetry.collect_remote(JETSON_HOST, user=JETSON_USER)
-    except telemetry.TelemetryError as exc:
-        jetson = {"status": "error", "detail": str(exc)}
 
-    return {"pi": pi, "jetson": jetson}
+# ==============================================================================
+# Job Execution Endpoints
+# ==============================================================================
 
 
 @app.post("/run")
-def run_job(req: JobRequest):
-    """Run a command on the Jetson."""
+@app.post("/jobs/run")
+def run_job(req: JobRequest, _: None = Depends(require_bearer_token)) -> Dict[str, Any]:
+    """Execute a remote command on the target host."""
+    if not req.command:
+        return {"ok": False, "error": "command required"}
+
     try:
-        result = jobs.run_remote(JETSON_HOST, req.command, user=JETSON_USER)
-    except jobs.JobError as exc:
+        result = jobs.run_remote(
+            req.command,
+            host=req.host or JETSON_HOST,
+            user=req.user or JETSON_USER,
+        )
+        return {
+            "ok": result.returncode == 0,
+            "command": req.command,
+            "stdout": (result.stdout or "").strip(),
+            "stderr": (result.stderr or "").strip(),
+            "returncode": result.returncode,
+        }
+    except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return result
 
 
-def main():
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+# ==============================================================================
+# SSH Key Management
+# ==============================================================================
 
 
-if __name__ == "__main__":
-    main()
-"""FastAPI application exposing flashing utilities and dashboard UI."""
-from __future__ import annotations
+@app.post("/connect/install-key")
+def install_ssh_key() -> Dict[str, Any]:
+    """Generate SSH key and copy to target host."""
+    host, user = active_target()
+    home = pathlib.Path.home()
+    ssh_dir = home / ".ssh"
+    ssh_dir.mkdir(parents=True, exist_ok=True)
+    key_path = ssh_dir / "id_rsa"
 
-import json
-from pathlib import Path
-from typing import Optional
+    if not key_path.exists():
+        subprocess.run(
+            ["ssh-keygen", "-t", "rsa", "-N", "", "-f", str(key_path)],
+            check=True,
+        )
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+    result = subprocess.call(
+        ["ssh-copy-id", "-i", f"{key_path}.pub", f"{user}@{host}"]
+    )
 
-from .flash import flash, list_devices
-
-KNOWN_IMAGES = [
-    {
-        "name": "Raspberry Pi OS Lite (arm64)",
-        "url": "https://downloads.raspberrypi.com/raspios_lite_arm64_latest",
-    },
-    {
-        "name": "Ubuntu Server 24.04 (RPI arm64)",
-        "url": "https://cdimage.ubuntu.com/releases/24.04/release/ubuntu-24.04.1-preinstalled-server-arm64+raspi.img.xz",
-    },
-    {
-        "name": "BlackRoad OS (latest)",
-        "url": "https://your.host/blackroad/latest.img.xz",
-        "sha256": "https://your.host/blackroad/latest.sha256",
-    },
-]
-
-app = FastAPI(title="BlackRoad Flasher")
+    return {
+        "ok": result == 0,
+        "note": "If this failed, run ssh-copy-id manually to enter the password.",
+    }
 
 
-@app.get("/")
-def dashboard() -> HTMLResponse:
-    """Serve the dashboard interface."""
-    html_path = Path(__file__).resolve().parent.parent / "dashboard.html"
-    html = html_path.read_text(encoding="utf-8")
-    return HTMLResponse(html)
-"""FastAPI app exposing the Pi flasher controls."""
-
-from __future__ import annotations
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-"""FastAPI endpoints exposing device flashing capabilities."""
-from __future__ import annotations
-
-import asyncio
-import threading
-from typing import Any, Dict, Optional
-
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from starlette.websockets import WebSocketState
-
-from agent import flash
-
-app = FastAPI(title="BlackRoad Agent API")
+# ==============================================================================
+# Flash Endpoints
+# ==============================================================================
 
 
 @app.get("/flash/devices")
-def flash_devices() -> dict:
-    """List available block devices."""
-    return {"devices": list_devices()}
+async def flash_devices() -> Dict[str, Any]:
+    """Return removable block devices available for flashing."""
+    devices = await asyncio.to_thread(flash.list_devices)
+    if isinstance(devices, dict) and "error" in devices:
+        raise HTTPException(status_code=500, detail=devices.get("error"))
+    return {"devices": devices}
 
 
 @app.get("/flash/images")
-def flash_images() -> dict:
-    """Return curated image suggestions."""
+def flash_images() -> Dict[str, Any]:
+    """Return curated OS image suggestions."""
     return {"images": KNOWN_IMAGES}
 
 
+@app.get("/flash/probe")
+def flash_probe(host: Optional[str] = None, user: Optional[str] = None) -> Dict[str, Any]:
+    """Probe flash capabilities on remote host."""
+    return flash.probe(host=host, user=user)
+
+
+def _start_flash_worker(
+    queue: asyncio.Queue,
+    loop: asyncio.AbstractEventLoop,
+    device: str,
+    image_url: str,
+    safe_hdmi: bool,
+    enable_ssh: bool,
+    stop: threading.Event,
+) -> threading.Thread:
+    """Start a background thread for flash operations."""
+    def worker() -> None:
+        try:
+            for line in flash.flash(
+                image_url,
+                device,
+                safe_hdmi=safe_hdmi,
+                enable_ssh=enable_ssh,
+            ):
+                if stop.is_set():
+                    break
+                asyncio.run_coroutine_threadsafe(queue.put(line), loop)
+        except Exception as exc:
+            asyncio.run_coroutine_threadsafe(queue.put(f"ERROR: {exc}"), loop)
+        finally:
+            asyncio.run_coroutine_threadsafe(queue.put(None), loop)
+
+    thread = threading.Thread(target=worker, name="flash-writer", daemon=True)
+    thread.start()
+    return thread
+
+
 @app.websocket("/ws/flash")
-async def ws_flash(websocket: WebSocket) -> None:
-    await websocket.accept()
+async def ws_flash(ws: WebSocket) -> None:
+    """Stream flashing progress via WebSocket."""
+    await ws.accept()
+    stop = threading.Event()
+    queue: asyncio.Queue = asyncio.Queue()
+    thread: Optional[threading.Thread] = None
+
     try:
-        payload_raw = await websocket.receive_text()
+        msg = await ws.receive_json()
+        device = msg.get("device")
+        image_url = msg.get("image_url")
+        safe_hdmi = bool(msg.get("safe_hdmi", True))
+        enable_ssh = bool(msg.get("enable_ssh", True))
+
+        if not device or not image_url:
+            await ws.send_text("ERROR: device and image_url are required")
+            await ws.send_text("[[BLACKROAD_DONE]]")
+            return
+
+        loop = asyncio.get_running_loop()
+        thread = _start_flash_worker(
+            queue, loop, device, image_url, safe_hdmi, enable_ssh, stop
+        )
+
+        while True:
+            line = await queue.get()
+            if line is None:
+                break
+            await ws.send_text(line)
+
+        await ws.send_text("[[BLACKROAD_DONE]]")
     except WebSocketDisconnect:
-        return
-
-    try:
-        payload = json.loads(payload_raw)
-    except json.JSONDecodeError:
-        await websocket.send_text("ERROR: invalid payload")
-        await websocket.close()
-        return
-
-    device = payload.get("device", "").strip()
-    image_url = payload.get("image_url", "").strip()
-    sha_url: Optional[str] = (payload.get("sha256_url") or payload.get("sha_url") or "").strip() or None
-
-    if not device or not image_url:
-        await websocket.send_text("ERROR: device and image_url required")
-        await websocket.close()
-        return
-
-    try:
-        for line in flash(device, image_url, sha_url):
-            await websocket.send_text(line)
-    except WebSocketDisconnect:
-        return
-    except Exception as exc:  # noqa: BLE001
-        await websocket.send_text(f"ERROR: {exc}")
+        pass
+    except Exception as exc:
+        await ws.send_text(f"ERROR: {exc}")
+        await ws.send_text("[[BLACKROAD_DONE]]")
     finally:
-        await websocket.close()
-from fastapi import FastAPI
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
-
-from agent import models
-"""FastAPI surface for agent utilities."""
-
-from __future__ import annotations
-
-import pathlib
-import tempfile
-
-from fastapi import FastAPI, File, UploadFile
-
-from agent import transcribe
-
-app = FastAPI(title="BlackRoad Agent API")
-
-_DASHBOARD_PATH = Path(__file__).resolve().parent.parent / "dashboard.html"
+        stop.set()
+        if thread is not None:
+            thread.join(timeout=1)
+        if ws.client_state == WebSocketState.CONNECTED:
+            await ws.close()
 
 
-def _load_dashboard() -> str:
-    """Load the dashboard HTML from disk."""
-
-    try:
-        return _DASHBOARD_PATH.read_text(encoding="utf-8")
-    except OSError as exc:  # pragma: no cover - protects startup failures
-        raise HTTPException(status_code=500, detail="dashboard unavailable") from exc
-
-
-@app.get("/", response_class=HTMLResponse)
-def dashboard() -> str:
-    """Serve the static dashboard UI."""
-
-    return _load_dashboard()
+# ==============================================================================
+# Model Endpoints
+# ==============================================================================
 
 
 @app.get("/models")
-def models_list() -> Dict[str, Any]:
+async def get_models() -> JSONResponse:
     """Return available local GGUF/BIN models."""
-
-    return {"models": models.list_models()}
+    return JSONResponse({"models": models.list_local_models()})
 
 
 @app.post("/models/run")
-def models_run(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Run a llama.cpp model once with the provided prompt."""
-
+def models_run(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Run a llama.cpp model with the provided prompt."""
     model = (payload or {}).get("model")
     prompt = (payload or {}).get("prompt", "")
     n_raw = (payload or {}).get("n", 128)
@@ -412,368 +510,18 @@ def models_run(payload: Dict[str, Any]) -> Dict[str, Any]:
     except FileNotFoundError:
         return {"error": f"model not found: {model}"}
 
+    # Security check: ensure model is in allowed directory
     try:
         resolved.relative_to(models.MODELS_DIR.resolve())
     except ValueError:
-        return {"error": "model must live under /var/lib/blackroad/models"}
+        return {"error": "model must live under the models directory"}
 
     return models.run_llama(str(resolved), prompt, n_predict=n_predict)
-    """Return removable devices available for flashing."""
-
-    return {"devices": flash.list_devices()}
-async def _list_devices() -> list[dict[str, Any]]:
-    data = await asyncio.to_thread(flash.list_devices)
-    if isinstance(data, dict):
-        message = data.get("error", "Failed to enumerate devices")
-        raise HTTPException(status_code=500, detail=message)
-    return data
-
-
-@app.get("/flash/devices")
-async def flash_devices() -> Dict[str, Any]:
-    """Return removable block devices available for flashing."""
-
-    devices = await _list_devices()
-    return {"devices": devices}
-
-
-def _start_flash_worker(
-    queue: "asyncio.Queue[str | None]",
-    loop: asyncio.AbstractEventLoop,
-    device: str,
-    image_url: str,
-    safe_hdmi: bool,
-    enable_ssh: bool,
-    stop: threading.Event,
-) -> threading.Thread:
-    def worker() -> None:
-        try:
-            for line in flash.flash(
-                image_url,
-                device,
-                safe_hdmi=safe_hdmi,
-                enable_ssh=enable_ssh,
-            ):
-                if stop.is_set():
-                    break
-                asyncio.run_coroutine_threadsafe(queue.put(line), loop)
-        except Exception as exc:  # pragma: no cover - safety net
-            asyncio.run_coroutine_threadsafe(queue.put(f"ERROR: {exc}"), loop)
-        finally:
-            asyncio.run_coroutine_threadsafe(queue.put(None), loop)
-
-    thread = threading.Thread(target=worker, name="flash-writer", daemon=True)
-    thread.start()
-    return thread
-
-
-@app.websocket("/ws/flash")
-async def ws_flash(ws: WebSocket) -> None:
-    """Stream flashing progress to the dashboard."""
-
-    await ws.accept()
-    await ws.accept()
-    stop = threading.Event()
-    queue: "asyncio.Queue[str | None]" = asyncio.Queue()
-    thread: Optional[threading.Thread] = None
-
-    try:
-        msg = await ws.receive_json()
-        device = msg.get("device")
-        image_url = msg.get("image_url")
-        if not device or not image_url:
-            await ws.send_text("ERROR: device and image_url required")
-            await ws.send_text("[[BLACKROAD_DONE]]")
-            return
-
-        for line in flash.flash(image_url, device):
-        safe_hdmi = bool(msg.get("safe_hdmi", True))
-        enable_ssh = bool(msg.get("enable_ssh", True))
-
-        if not device or not image_url:
-            await ws.send_text("ERROR: device and image_url are required")
-            return
-
-        loop = asyncio.get_running_loop()
-        thread = _start_flash_worker(
-            queue,
-            loop,
-            device,
-            image_url,
-            safe_hdmi,
-            enable_ssh,
-            stop,
-        )
-
-        while True:
-            line = await queue.get()
-            if line is None:
-                break
-            await ws.send_text(line)
-
-        await ws.send_text("[[BLACKROAD_DONE]]")
-    except WebSocketDisconnect:
-        return
-    except Exception as exc:  # pragma: no cover - network/runtime failure
-        await ws.send_text(f"ERROR: {exc}")
-        await ws.send_text("[[BLACKROAD_DONE]]")
-    finally:
-        if ws.application_state != WebSocketState.DISCONNECTED:
-        stop.set()
-    except Exception as exc:  # pragma: no cover - defensive guard
-        await ws.send_text(f"ERROR: {exc}")
-    finally:
-        stop.set()
-        if thread is not None:
-            thread.join(timeout=1)
-        if ws.client_state == WebSocketState.CONNECTED:
-            await ws.close()
-@app.get("/connect/test")
-def connect_test() -> Dict[str, Any]:
-    """Attempt to gather telemetry from the Pi and Jetson."""
-    try:
-        pi = telemetry.collect_local()
-        jetson = telemetry.collect_remote()
-        ok = all(not str(value).startswith("error") for value in jetson.values())
-        return {"ok": ok, "pi": pi, "jetson": jetson}
-    except Exception as exc:  # pragma: no cover - defensive
-        return {"ok": False, "error": str(exc)}
-
-
-@app.post("/connect/install-key")
-def install_key() -> Dict[str, Any]:
-    """Generate an SSH key for the `pi` user and copy it to the Jetson target."""
-    host, user = active_target()
-    home = pathlib.Path("/home/pi")
-    ssh_dir = home / ".ssh"
-    ssh_dir.mkdir(parents=True, exist_ok=True)
-    key_path = ssh_dir / "id_rsa"
-
-    if not key_path.exists():
-        subprocess.run(
-            [
-                "sudo",
-                "-u",
-                "pi",
-                "ssh-keygen",
-                "-t",
-                "rsa",
-                "-N",
-                "",
-                "-f",
-                str(key_path),
-            ],
-            check=True,
-        )
-
-    result = subprocess.call(
-        [
-            "sudo",
-            "-u",
-            "pi",
-            "ssh-copy-id",
-            "-i",
-            f"{key_path}.pub",
-            f"{user}@{host}",
-        ]
-    )
-    note = (
-        "If this returned false, run ssh-copy-id manually in a shell to enter the password."
-    )
-    return {"ok": result == 0, "note": note}
-
-
-@app.get("/telemetry/local")
-def telemetry_local() -> Dict[str, Any]:
-    """Expose local telemetry for the dashboard."""
-    return telemetry.collect_local()
-
-
-@app.get("/telemetry/remote")
-def telemetry_remote(host: str | None = None, user: str | None = None) -> Dict[str, Any]:
-    """Expose remote telemetry, allowing overrides via query parameters."""
-    return telemetry.collect_remote(host=host, user=user)
-
-
-@app.post("/jobs/run")
-def run_job(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-    """Execute a remote command on the Jetson target."""
-    command = payload.get("command")
-    host = payload.get("host")
-    user = payload.get("user")
-    if not command:
-        return {"ok": False, "error": "command required"}
-    result = jobs.run_remote(command, host=host, user=user)
-    return {
-        "ok": result.returncode == 0,
-        "stdout": (result.stdout or "").strip(),
-        "stderr": (result.stderr or "").strip(),
-    }
-
-
-@app.get("/flash/probe")
-def flash_probe(host: str | None = None, user: str | None = None) -> Dict[str, Any]:
-    """Call the flash probe helper."""
-    return flash.probe(host=host, user=user)
-
-
-__all__ = ["app"]
-"""FastAPI application powering the agent dashboard."""
-
-from __future__ import annotations
-
-import asyncio
-import json
-import pathlib
-import threading
-from typing import Any
-
-from fastapi import File, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
-
-from agent import transcribe
-
-app = FastAPI(title="BlackRoad Agent Dashboard")
-templates = Jinja2Templates(directory=str(pathlib.Path(__file__).parent / "templates"))
-
-
-@app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request) -> HTMLResponse:
-    """Render the dashboard UI."""
-
-    return templates.TemplateResponse("dashboard.html", {"request": request})
-
-
-@app.post("/transcribe/upload")
-async def transcribe_upload(file: UploadFile = File(...)) -> dict[str, Any]:
-    data = await file.read()
-    suffix = pathlib.Path(file.filename or "audio.wav").suffix
-    path = transcribe.save_upload(data, suffix=suffix)
-    token = pathlib.Path(path).name
-    return {"token": token}
-
-
-@app.websocket("/ws/transcribe/run")
-async def ws_transcribe(ws: WebSocket) -> None:
-    await ws.accept()
-    try:
-        try:
-            msg = await ws.receive_text()
-        except WebSocketDisconnect:
-            return
-        except Exception:  # pragma: no cover - unexpected
-            await ws.send_text("[error] invalid request")
-            return
-
-        try:
-            payload = json.loads(msg)
-        except json.JSONDecodeError:
-            await ws.send_text("[error] invalid json")
-            return
-
-        token = payload.get("token")
-        lang = payload.get("lang", "en")
-        model = payload.get("model")
-
-        if not token:
-            await ws.send_text("[error] missing token")
-            return
-
-        candidate = (transcribe.TMP_DIR / token).resolve()
-        try:
-            candidate.relative_to(transcribe.TMP_DIR)
-        except ValueError:
-            await ws.send_text("[error] bad token")
-            return
-
-        if not candidate.exists():
-            await ws.send_text("[error] audio not found")
-            return
-
-        queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
-        loop = asyncio.get_running_loop()
-
-        def pump_stream() -> None:
-            try:
-                for line in transcribe.run_whisper_stream(
-                    str(candidate), model_path=model, lang=lang
-                ):
-                    loop.call_soon_threadsafe(queue.put_nowait, ("data", line))
-            except Exception as exc:  # pragma: no cover - defensive
-                loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
-            finally:
-                loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
-
-        thread = threading.Thread(target=pump_stream, name="whisper-stream", daemon=True)
-        thread.start()
-
-        try:
-            while True:
-                kind, payload = await queue.get()
-
-                try:
-                    if kind == "data" and payload is not None:
-                        await ws.send_text(payload)
-                    elif kind == "error" and payload is not None:
-                        await ws.send_text(f"[error] {payload}")
-                    elif kind == "done":
-                        await ws.send_text("[[BLACKROAD_WHISPER_DONE]]")
-                        break
-                except WebSocketDisconnect:
-                    break
-        finally:
-            if thread.is_alive():
-                await asyncio.to_thread(thread.join)
-    finally:
-        try:
-            await ws.close()
-        except WebSocketDisconnect:
-            pass
-        except RuntimeError:
-            # Connection already closed or closing; safe to ignore.
-            pass
-@app.post("/transcribe")
-async def transcribe_audio(file: UploadFile = File(...)) -> dict[str, str]:
-    """Accept an uploaded audio file and run whisper.cpp locally."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        data = await file.read()
-        tmp.write(data)
-        tmp_path = pathlib.Path(tmp.name)
-
-    try:
-        text = transcribe.run_whisper(str(tmp_path))
-    finally:
-        tmp_path.unlink(missing_ok=True)
-
-    return {"text": text}
-"""FastAPI endpoints for streaming local model tokens to the dashboard."""
-
-from __future__ import annotations
-
-import asyncio
-import contextlib
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
-
-from . import models
-
-app = FastAPI(title="BlackRoad Local Models")
-
-
-@app.get("/models")
-async def get_models() -> JSONResponse:
-    """Return the available local models."""
-
-    return JSONResponse({"models": models.list_local_models()})
 
 
 @app.websocket("/ws/model")
 async def ws_model(ws: WebSocket) -> None:
-    """Stream llama.cpp output over the websocket connection."""
-
+    """Stream llama.cpp output via WebSocket."""
     await ws.accept()
     try:
         message = await ws.receive_json()
@@ -794,9 +542,7 @@ async def ws_model(ws: WebSocket) -> None:
 
         def stream_tokens() -> None:
             try:
-                for token in models.run_llama_stream(
-                    model, prompt, n_predict=n_predict
-                ):
+                for token in models.run_llama_stream(model, prompt, n_predict=n_predict):
                     send_future = asyncio.run_coroutine_threadsafe(
                         ws.send_text(token), loop
                     )
@@ -804,9 +550,9 @@ async def ws_model(ws: WebSocket) -> None:
                         send_future.result()
                     except WebSocketDisconnect:
                         break
-            except Exception as stream_exc:  # pragma: no cover - defensive in thread
+            except Exception as exc:
                 asyncio.run_coroutine_threadsafe(
-                    ws.send_text(f"[error] {stream_exc}"), loop
+                    ws.send_text(f"[error] {exc}"), loop
                 ).result()
             finally:
                 asyncio.run_coroutine_threadsafe(
@@ -816,49 +562,145 @@ async def ws_model(ws: WebSocket) -> None:
 
         await asyncio.gather(asyncio.to_thread(stream_tokens), done_event.wait())
     except WebSocketDisconnect:
-        return
-    except Exception as exc:  # pragma: no cover - defensive; websocket lifecycle
+        pass
+    except Exception as exc:
         await ws.send_text(f"[error] {exc}")
         await ws.send_text("[[BLACKROAD_MODEL_DONE]]")
     finally:
         with contextlib.suppress(RuntimeError):
             await ws.close()
-JETSON_HOST = os.getenv("JETSON_HOST", "jetson.local")
-JETSON_USER = os.getenv("JETSON_USER", "jetson")
-AUTH_TOKEN = os.getenv("AGENT_AUTH_TOKEN")
-
-if not AUTH_TOKEN:
-    raise RuntimeError("AGENT_AUTH_TOKEN environment variable must be set for the API service")
 
 
-def require_bearer_token(authorization: str = Header(default="")):
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or token != AUTH_TOKEN:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+# ==============================================================================
+# Transcription Endpoints
+# ==============================================================================
 
 
-class JobRequest(BaseModel):
-    command: str
+@app.post("/transcribe")
+async def transcribe_audio_simple(file: UploadFile = File(...)) -> Dict[str, str]:
+    """Accept an uploaded audio file and run whisper.cpp locally."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        data = await file.read()
+        tmp.write(data)
+        tmp_path = pathlib.Path(tmp.name)
+
+    try:
+        text = transcribe.run_whisper(str(tmp_path))
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    return {"text": text}
 
 
-@app.get("/status")
-def status(_: None = Depends(require_bearer_token)):
-    return {
-        "target": {"host": JETSON_HOST, "user": JETSON_USER},
-        "pi": telemetry.collect_local(),
-        "jetson": telemetry.collect_remote(JETSON_HOST, JETSON_USER),
-    }
+@app.post("/transcribe/upload")
+async def transcribe_upload(file: UploadFile = File(...)) -> Dict[str, Any]:
+    """Upload audio file for streaming transcription."""
+    data = await file.read()
+    suffix = pathlib.Path(file.filename or "audio.wav").suffix
+    path = transcribe.save_upload(data, suffix=suffix)
+    token = pathlib.Path(path).name
+    return {"token": token}
 
 
-@app.post("/run")
-def run_job(req: JobRequest, _: None = Depends(require_bearer_token)):
-    jobs.run_remote(JETSON_HOST, req.command, JETSON_USER)
-    return {"ok": True, "command": req.command}
+@app.websocket("/ws/transcribe/run")
+async def ws_transcribe(ws: WebSocket) -> None:
+    """Stream transcription results via WebSocket."""
+    await ws.accept()
+    try:
+        msg = await ws.receive_text()
+        payload = json.loads(msg)
+        token = payload.get("token")
+        lang = payload.get("lang", "en")
+        model = payload.get("model")
+
+        if not token:
+            await ws.send_text("[error] missing token")
+            return
+
+        candidate = (transcribe.TMP_DIR / token).resolve()
+        try:
+            candidate.relative_to(transcribe.TMP_DIR)
+        except ValueError:
+            await ws.send_text("[error] bad token")
+            return
+
+        if not candidate.exists():
+            await ws.send_text("[error] audio not found")
+            return
+
+        queue: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def pump_stream() -> None:
+            try:
+                for line in transcribe.run_whisper_stream(
+                    str(candidate), model_path=model, lang=lang
+                ):
+                    loop.call_soon_threadsafe(queue.put_nowait, ("data", line))
+            except Exception as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+
+        thread = threading.Thread(target=pump_stream, name="whisper-stream", daemon=True)
+        thread.start()
+
+        try:
+            while True:
+                kind, data = await queue.get()
+                if kind == "data" and data is not None:
+                    await ws.send_text(data)
+                elif kind == "error" and data is not None:
+                    await ws.send_text(f"[error] {data}")
+                elif kind == "done":
+                    await ws.send_text("[[BLACKROAD_WHISPER_DONE]]")
+                    break
+        finally:
+            if thread.is_alive():
+                await asyncio.to_thread(thread.join)
+    except WebSocketDisconnect:
+        pass
+    except json.JSONDecodeError:
+        await ws.send_text("[error] invalid json")
+    except Exception as exc:
+        await ws.send_text(f"[error] {exc}")
+    finally:
+        with contextlib.suppress(RuntimeError, WebSocketDisconnect):
+            await ws.close()
 
 
-def main():
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+# ==============================================================================
+# WebSocket Logs
+# ==============================================================================
+
+
+@app.websocket("/ws/logs")
+async def logs_websocket(websocket: WebSocket) -> None:
+    """Echo socket for log streaming."""
+    await manager.connect(websocket)
+    try:
+        while True:
+            payload = await websocket.receive_text()
+            await manager.broadcast(json.dumps({"echo": payload}))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        manager.disconnect(websocket)
+
+
+# ==============================================================================
+# Entry Point
+# ==============================================================================
+
+
+def main() -> None:
+    """Run the API server."""
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+if __name__ == "__main__":
+    main()
+
+
+__all__ = ["app", "main"]
