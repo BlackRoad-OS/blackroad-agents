@@ -2,58 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
-
-from agent.auth import TokenAuthMiddleware
-
-BASE_DIR = Path(__file__).resolve().parent
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-
-app = FastAPI(title="BlackRoad Dashboard", version="1.0.0")
-app.add_middleware(TokenAuthMiddleware)
-
-
-@app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request) -> HTMLResponse:
-    """Render the dashboard UI."""
-    return templates.TemplateResponse("dashboard.html", {"request": request})
-import uvicorn
-
-from agent import telemetry
-
-app = FastAPI(title="BlackRoad Dashboard")
-_templates_dir = Path(__file__).parent / "templates"
-templates = Jinja2Templates(directory=str(_templates_dir))
-"""FastAPI application providing the BlackRoad device dashboard."""
-
-from __future__ import annotations
-
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
-
-from agent import jobs, telemetry
-from fastapi import FastAPI, Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
-import uvicorn
-from agent import telemetry, jobs
-
-app = FastAPI(title="BlackRoad Dashboard")
-templates = Jinja2Templates(directory="agent/templates")
-
-JETSON_HOST = "jetson.local"
-JETSON_USER = "jetson"
-
-
-@app.get("/", response_class=HTMLResponse)
-def home(request: Request):
-def home(request: Request) -> HTMLResponse:
-    """Render the dashboard page with telemetry from the Pi and Jetson."""
 import asyncio
 import base64
 import os
@@ -75,6 +23,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.templating import Jinja2Templates
 import uvicorn
+
 from agent import telemetry, jobs
 
 app = FastAPI(title="BlackRoad Dashboard")
@@ -109,7 +58,7 @@ def _require_websocket_basic_auth(websocket: WebSocket):
     try:
         encoded = header.split(" ", 1)[1]
         decoded = base64.b64decode(encoded).decode()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid credentials") from exc
     username, _, password = decoded.partition(":")
     username_ok = secrets.compare_digest(username, DASHBOARD_USERNAME)
@@ -124,26 +73,12 @@ def home(request: Request, _: HTTPBasicCredentials = Depends(require_basic_auth)
     jetson = telemetry.collect_remote(JETSON_HOST, user=JETSON_USER)
     return templates.TemplateResponse(
         "dashboard.html",
-        {"request": request, "pi": pi, "jetson": jetson},
-    )
-
-
-def main():
-    uvicorn.run(app, host="0.0.0.0", port=8081)
-@app.websocket("/ws/run")
-async def ws_run(websocket: WebSocket) -> None:
-    """WebSocket endpoint streaming command output from the Jetson."""
-    await websocket.accept()
-    try:
-        cmd = await websocket.receive_text()
-        for line in jobs.run_remote_stream(JETSON_HOST, cmd, user=JETSON_USER):
         {
             "request": request,
             "pi": pi,
             "jetson": jetson,
             "target": {"host": JETSON_HOST, "user": JETSON_USER},
         }
-        {"request": request, "pi": pi, "jetson": jetson}
     )
 
 
@@ -152,7 +87,6 @@ def run_job(
     command: str = Form(...),
     _: HTTPBasicCredentials = Depends(require_basic_auth),
 ):
-def run_job(command: str = Form(...)):
     jobs.run_remote(JETSON_HOST, command, user=JETSON_USER)
     return RedirectResponse("/", status_code=303)
 
@@ -198,8 +132,6 @@ async def ws_run(websocket: WebSocket):
         await websocket.close()
 
 
-def main():
-    uvicorn.run(app, host="0.0.0.0", port=8081)
 def main():
     uvicorn.run(app, host="0.0.0.0", port=8081)
 
