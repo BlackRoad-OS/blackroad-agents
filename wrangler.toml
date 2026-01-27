@@ -1,14 +1,130 @@
+# ⬛⬜🛣️ BlackRoad Agents - Cloudflare Workers Configuration
+# Self-healing agent job system with cross-repo syncing
+
 name = "blackroad-agents"
 main = "src/index.js"
 compatibility_date = "2024-12-01"
 account_id = "848cf0b18d51e0170e0d1537aec3505a"
+workers_dev = true
 
 [vars]
 REPO_NAME = "blackroad-agents"
 ORG_NAME = "BlackRoad-OS"
 ENVIRONMENT = "production"
+VERSION = "2.0.0"
 
-# Add KV, D1, R2 bindings as needed
-# [[kv_namespaces]]
-# binding = "CACHE"
-# id = "YOUR_KV_ID"
+# ============================================================================
+# Scheduled Jobs (Cron Triggers) - Agent Tasks
+# ============================================================================
+# These run automatically to keep the ecosystem cohesive and self-healing
+
+[triggers]
+crons = [
+  # Every 5 minutes - Quick health check & self-healing
+  "*/5 * * * *",
+
+  # Every 15 minutes - Cross-repo sync check
+  "*/15 * * * *",
+
+  # Every hour - Full repo scrape & cohesion analysis
+  "0 * * * *",
+
+  # Every 6 hours - Deep analysis & learning aggregation
+  "0 */6 * * *",
+
+  # Daily at midnight UTC - Full system reconciliation
+  "0 0 * * *"
+]
+
+# ============================================================================
+# KV Namespaces - State Storage
+# ============================================================================
+
+[[kv_namespaces]]
+binding = "AGENT_STATE"
+id = "blackroad-agents-state"
+preview_id = "blackroad-agents-state-preview"
+
+[[kv_namespaces]]
+binding = "REPO_CACHE"
+id = "blackroad-repo-cache"
+preview_id = "blackroad-repo-cache-preview"
+
+[[kv_namespaces]]
+binding = "JOB_QUEUE"
+id = "blackroad-job-queue"
+preview_id = "blackroad-job-queue-preview"
+
+[[kv_namespaces]]
+binding = "LEARNING_MEMORY"
+id = "blackroad-learning-memory"
+preview_id = "blackroad-learning-memory-preview"
+
+# ============================================================================
+# D1 Database - Persistent Storage
+# ============================================================================
+
+[[d1_databases]]
+binding = "DB"
+database_name = "blackroad-agents-db"
+database_id = "blackroad-agents-database"
+
+# ============================================================================
+# Durable Objects - Long-Running Agent Tasks
+# ============================================================================
+
+[durable_objects]
+bindings = [
+  { name = "AGENT_COORDINATOR", class_name = "AgentCoordinator" },
+  { name = "REPO_SYNCER", class_name = "RepoSyncer" },
+  { name = "SELF_HEALER", class_name = "SelfHealer" },
+  { name = "JOB_ORCHESTRATOR", class_name = "JobOrchestrator" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["AgentCoordinator", "RepoSyncer", "SelfHealer", "JobOrchestrator"]
+
+# ============================================================================
+# R2 Buckets - Large Object Storage
+# ============================================================================
+
+[[r2_buckets]]
+binding = "ARTIFACTS"
+bucket_name = "blackroad-agent-artifacts"
+preview_bucket_name = "blackroad-agent-artifacts-preview"
+
+# ============================================================================
+# Environment-Specific Configuration
+# ============================================================================
+
+[env.staging]
+name = "blackroad-agents-staging"
+vars = { ENVIRONMENT = "staging" }
+
+[env.production]
+name = "blackroad-agents"
+vars = { ENVIRONMENT = "production" }
+routes = [
+  { pattern = "agents.blackroad.ai/*", zone_name = "blackroad.ai" },
+  { pattern = "api.blackroad.ai/agents/*", zone_name = "blackroad.ai" }
+]
+
+# ============================================================================
+# Build Configuration
+# ============================================================================
+
+[build]
+command = "npm run build"
+watch_dir = "src"
+
+[build.upload]
+format = "modules"
+main = "./src/index.js"
+
+# ============================================================================
+# Observability
+# ============================================================================
+
+[observability.logs]
+enabled = true
