@@ -3,12 +3,89 @@ main = "src/index.js"
 compatibility_date = "2024-12-01"
 account_id = "848cf0b18d51e0170e0d1537aec3505a"
 
+# Workers Paid plan features
+workers_dev = true
+node_compat = true
+
 [vars]
 REPO_NAME = "blackroad-agents"
 ORG_NAME = "BlackRoad-OS"
 ENVIRONMENT = "production"
+VERSION = "1.0.0"
 
-# Add KV, D1, R2 bindings as needed
-# [[kv_namespaces]]
-# binding = "CACHE"
-# id = "YOUR_KV_ID"
+# KV Namespace for caching and job storage
+[[kv_namespaces]]
+binding = "KV"
+id = "blackroad-agents-kv"
+preview_id = "blackroad-agents-kv-preview"
+
+# D1 Database for persistent job data
+[[d1_databases]]
+binding = "D1"
+database_name = "blackroad-agents-db"
+database_id = "blackroad-agents-d1"
+
+# Queue for async job processing
+[[queues.producers]]
+queue = "blackroad-agent-jobs"
+binding = "JOB_QUEUE"
+
+[[queues.consumers]]
+queue = "blackroad-agent-jobs"
+max_batch_size = 10
+max_batch_timeout = 30
+max_retries = 3
+dead_letter_queue = "blackroad-agent-jobs-dlq"
+
+# Dead letter queue for failed jobs
+[[queues.producers]]
+queue = "blackroad-agent-jobs-dlq"
+binding = "DLQ"
+
+# R2 Bucket for large artifacts
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "blackroad-agents-artifacts"
+
+# Scheduled triggers for automated jobs
+[triggers]
+crons = [
+  "*/15 * * * *",   # Every 15 minutes - health check
+  "0 */6 * * *",    # Every 6 hours - repo sync
+  "0 0 * * *"       # Daily at midnight - cohesiveness check & dependency audit
+]
+
+# Secrets (set via wrangler secret put)
+# - GITHUB_TOKEN: GitHub API token for repo access
+# - GITHUB_WEBHOOK_SECRET: Webhook signature verification
+
+# Environment-specific configuration
+[env.staging]
+name = "blackroad-agents-staging"
+vars = { ENVIRONMENT = "staging" }
+
+[env.development]
+name = "blackroad-agents-dev"
+vars = { ENVIRONMENT = "development" }
+workers_dev = true
+
+# Durable Objects (for distributed state - future use)
+# [[durable_objects.bindings]]
+# name = "JOB_COORDINATOR"
+# class_name = "JobCoordinator"
+
+# [[migrations]]
+# tag = "v1"
+# new_classes = ["JobCoordinator"]
+
+# Build configuration
+[build]
+command = ""
+
+# Observability
+[observability]
+enabled = true
+
+# Limits
+[limits]
+cpu_ms = 50000

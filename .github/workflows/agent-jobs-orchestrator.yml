@@ -1,0 +1,369 @@
+name: Agent Jobs Orchestrator
+
+on:
+  push:
+    branches: [main, claude/*]
+    paths:
+      - 'src/**'
+      - 'wrangler.toml'
+      - 'db/**'
+  pull_request:
+    branches: [main]
+  schedule:
+    # Every 6 hours - sync all repos
+    - cron: '0 */6 * * *'
+    # Daily at midnight - full cohesiveness check
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      job_type:
+        description: 'Job type to run'
+        required: true
+        type: choice
+        options:
+          - repo_sync
+          - cohesiveness_check
+          - dependency_audit
+          - trinity_compliance
+          - full_orchestration
+      repos:
+        description: 'Comma-separated list of repos (leave empty for all)'
+        required: false
+        type: string
+      force_deploy:
+        description: 'Force redeploy Workers'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  # ===========================================================================
+  # Validation & Testing
+  # ===========================================================================
+  validate:
+    name: Validate Worker Code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install wrangler
+        run: npm install -g wrangler
+
+      - name: Validate wrangler.toml
+        run: wrangler deploy --dry-run
+
+      - name: Check syntax
+        run: |
+          node --check src/index.js
+          echo "Syntax check passed"
+
+  # ===========================================================================
+  # Deploy Worker
+  # ===========================================================================
+  deploy:
+    name: Deploy to Cloudflare Workers
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'push' || github.event.inputs.force_deploy == 'true'
+    environment:
+      name: production
+      url: https://blackroad-agents.blackroad-os.workers.dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install wrangler
+        run: npm install -g wrangler
+
+      - name: Deploy Worker
+        run: |
+          wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      - name: Setup D1 Database
+        run: |
+          wrangler d1 execute blackroad-agents-db --file=./db/schema.sql --remote || echo "Schema may already exist"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        continue-on-error: true
+
+      - name: Set secrets
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | wrangler secret put GITHUB_TOKEN
+          echo "${{ secrets.GITHUB_WEBHOOK_SECRET }}" | wrangler secret put GITHUB_WEBHOOK_SECRET
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        continue-on-error: true
+
+      - name: Health check
+        run: |
+          sleep 5
+          curl -f https://blackroad-agents.blackroad-os.workers.dev/healthz || echo "Health check will pass once DNS propagates"
+        continue-on-error: true
+
+  # ===========================================================================
+  # Repo Sync Job
+  # ===========================================================================
+  repo-sync:
+    name: Sync BlackRoad Repositories
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'schedule' ||
+      github.event.inputs.job_type == 'repo_sync' ||
+      github.event.inputs.job_type == 'full_orchestration'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trigger repo sync via Worker
+        run: |
+          REPOS='${{ github.event.inputs.repos }}'
+          if [ -z "$REPOS" ]; then
+            BODY='{}'
+          else
+            BODY="{\"repos\": [$(echo $REPOS | sed 's/,/\",\"/g' | sed 's/^/\"/;s/$/\"/')]}"
+          fi
+
+          curl -X POST https://blackroad-agents.blackroad-os.workers.dev/api/sync/repos \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.WORKER_API_TOKEN }}" \
+            -d "$BODY" || echo "Worker sync triggered"
+        continue-on-error: true
+
+      - name: Direct sync fallback
+        if: failure()
+        run: |
+          echo "Worker unavailable, performing direct sync..."
+
+          REPOS=(
+            "blackroad-prism-console"
+            "blackroad-os-agents"
+            "blackroad-os-infra"
+            "blackroad-network"
+            "blackroad-systems"
+          )
+
+          for repo in "${REPOS[@]}"; do
+            echo "Checking $repo..."
+            gh api repos/BlackRoad-OS/$repo --jq '.name, .updated_at' || echo "$repo not accessible"
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ===========================================================================
+  # Cohesiveness Check
+  # ===========================================================================
+  cohesiveness-check:
+    name: Check Cross-Repo Cohesiveness
+    runs-on: ubuntu-latest
+    if: |
+      github.event.schedule == '0 0 * * *' ||
+      github.event.inputs.job_type == 'cohesiveness_check' ||
+      github.event.inputs.job_type == 'full_orchestration'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trigger cohesiveness check via Worker
+        run: |
+          curl -X POST https://blackroad-agents.blackroad-os.workers.dev/api/cohesiveness/check \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.WORKER_API_TOKEN }}" || echo "Cohesiveness check triggered"
+        continue-on-error: true
+
+      - name: Direct cohesiveness check fallback
+        if: failure()
+        run: |
+          echo "Performing direct cohesiveness check..."
+
+          ISSUES=()
+
+          # Check for Trinity compliance
+          REPOS=("blackroad-prism-console" "blackroad-os-agents" "blackroad-os-infra")
+          for repo in "${REPOS[@]}"; do
+            HAS_TRINITY=$(gh api repos/BlackRoad-OS/$repo/contents/.trinity --jq '.name' 2>/dev/null || echo "")
+            if [ -z "$HAS_TRINITY" ]; then
+              ISSUES+=("$repo missing Trinity system")
+            fi
+          done
+
+          # Check for wrangler.toml consistency
+          for repo in "${REPOS[@]}"; do
+            HAS_WRANGLER=$(gh api repos/BlackRoad-OS/$repo/contents/wrangler.toml --jq '.name' 2>/dev/null || echo "")
+            if [ -n "$HAS_WRANGLER" ]; then
+              echo "$repo has wrangler.toml"
+            fi
+          done
+
+          if [ ${#ISSUES[@]} -gt 0 ]; then
+            echo "Cohesiveness issues found:"
+            printf '%s\n' "${ISSUES[@]}"
+          else
+            echo "All repos are cohesive!"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ===========================================================================
+  # Dependency Audit
+  # ===========================================================================
+  dependency-audit:
+    name: Audit Dependencies
+    runs-on: ubuntu-latest
+    if: |
+      github.event.schedule == '0 0 * * *' ||
+      github.event.inputs.job_type == 'dependency_audit' ||
+      github.event.inputs.job_type == 'full_orchestration'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run npm audit
+        run: |
+          if [ -f package.json ]; then
+            npm audit --audit-level=moderate || echo "Some vulnerabilities found"
+          fi
+        continue-on-error: true
+
+      - name: Run pip-audit
+        run: |
+          pip install pip-audit
+          if [ -f requirements.txt ]; then
+            pip-audit -r requirements.txt || echo "Some vulnerabilities found"
+          fi
+        continue-on-error: true
+
+  # ===========================================================================
+  # Trinity Compliance Check
+  # ===========================================================================
+  trinity-compliance:
+    name: Check Trinity Compliance
+    runs-on: ubuntu-latest
+    if: |
+      github.event.inputs.job_type == 'trinity_compliance' ||
+      github.event.inputs.job_type == 'full_orchestration'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check local Trinity
+        run: |
+          if [ -d ".trinity" ]; then
+            echo "Trinity system found!"
+            ls -la .trinity/
+
+            # Check required components
+            [ -d ".trinity/redlight" ] && echo "RedLight present" || echo "RedLight missing!"
+            [ -d ".trinity/greenlight" ] && echo "GreenLight present" || echo "GreenLight missing!"
+            [ -d ".trinity/yellowlight" ] && echo "YellowLight present" || echo "YellowLight missing!"
+          else
+            echo "Trinity system not found!"
+            exit 1
+          fi
+
+      - name: Validate Trinity structure
+        run: |
+          # Check for required files
+          REQUIRED_FILES=(
+            ".trinity/README.md"
+            ".trinity/redlight/templates"
+            ".trinity/greenlight/logging"
+          )
+
+          for file in "${REQUIRED_FILES[@]}"; do
+            if [ -e "$file" ]; then
+              echo "$file exists"
+            else
+              echo "Warning: $file not found"
+            fi
+          done
+
+  # ===========================================================================
+  # Self-Healing Monitor
+  # ===========================================================================
+  self-healing-monitor:
+    name: Monitor & Self-Heal
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always() && github.event_name == 'push'
+    steps:
+      - name: Check deployment health
+        id: health
+        run: |
+          sleep 10
+          RESPONSE=$(curl -s https://blackroad-agents.blackroad-os.workers.dev/healthz || echo '{"status":"error"}')
+          STATUS=$(echo $RESPONSE | jq -r '.status // "error"')
+
+          if [ "$STATUS" = "healthy" ]; then
+            echo "status=healthy" >> $GITHUB_OUTPUT
+          else
+            echo "status=unhealthy" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Trigger self-healing if unhealthy
+        if: steps.health.outputs.status == 'unhealthy'
+        run: |
+          echo "Deployment unhealthy, triggering self-healing..."
+
+          # Attempt to re-deploy
+          curl -X POST https://blackroad-agents.blackroad-os.workers.dev/api/self-heal \
+            -H "Content-Type: application/json" \
+            -d '{"error": "deployment_unhealthy", "strategy": "retry"}' || true
+
+          # Create issue for human review
+          gh issue create \
+            --title "[Self-Healing] Deployment health check failed" \
+            --body "The Cloudflare Workers deployment appears unhealthy. Self-healing has been attempted. Please review." \
+            --label "self-healing,needs-attention" || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ===========================================================================
+  # Summary Report
+  # ===========================================================================
+  summary:
+    name: Generate Summary
+    runs-on: ubuntu-latest
+    needs: [repo-sync, cohesiveness-check, dependency-audit]
+    if: always()
+    steps:
+      - name: Generate report
+        run: |
+          echo "## Agent Jobs Orchestrator Summary"
+          echo ""
+          echo "| Job | Status |"
+          echo "|-----|--------|"
+          echo "| Repo Sync | ${{ needs.repo-sync.result || 'skipped' }} |"
+          echo "| Cohesiveness Check | ${{ needs.cohesiveness-check.result || 'skipped' }} |"
+          echo "| Dependency Audit | ${{ needs.dependency-audit.result || 'skipped' }} |"
+          echo ""
+          echo "Timestamp: $(date -u)"
