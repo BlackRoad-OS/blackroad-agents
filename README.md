@@ -1,148 +1,44 @@
-# BlackRoad Agents
+# ⚠️ DEPRECATED - This repository has been archived
 
-**Agent API with telemetry, job scheduling, and CeCe dynamic planner.**
+> **This repository is deprecated and read-only.**
+> 
+> All code has been migrated to the canonical BlackRoad OS repositories.
 
-```bash
-pip install blackroad-agents
-```
+## Migration Target
 
-## What is this?
+| Source | Target | PR |
+|--------|--------|-----|
+| `cece/` | [blackroad-os-agents](https://github.com/BlackRoad-OS/blackroad-os-agents) | [#5](https://github.com/BlackRoad-OS/blackroad-os-agents/pull/5) |
+| `agent/` | [blackroad-os-agents](https://github.com/BlackRoad-OS/blackroad-os-agents) | [#5](https://github.com/BlackRoad-OS/blackroad-os-agents/pull/5) |
 
-BlackRoad Agents provides the runtime infrastructure for AI agent orchestration:
+## New Locations
 
-| Component | Description |
-|-----------|-------------|
-| **Agent API** | REST API for agent registration, health, and task dispatch |
-| **Telemetry** | Real-time metrics collection and monitoring (1,298 lines) |
-| **Job Scheduler** | Priority-based job queue with retries and backoff |
-| **Store** | Persistent agent state and configuration storage |
-| **CeCe** | Dynamic planner with self-healing orchestration |
-
-## Quick Start
-
-### Run the API Server
-
-```bash
-# With pip
-blackroad-agent
-
-# With Docker
-docker build -t blackroad-agents .
-docker run -p 8000:8000 blackroad-agents
-
-# With Railway
-railway up
-```
-
-### API Endpoints
-
-```bash
-# Health check
-curl http://localhost:8000/health
-
-# Register an agent
-curl -X POST http://localhost:8000/agents/register \
-  -H "Content-Type: application/json" \
-  -d '{"name": "worker-1", "capabilities": ["code-review", "testing"]}'
-
-# Submit a job
-curl -X POST http://localhost:8000/jobs/submit \
-  -H "Content-Type: application/json" \
-  -d '{"type": "code-review", "payload": {"pr": 123}}'
-
-# Get telemetry
-curl http://localhost:8000/telemetry/metrics
-```
-
-## CeCe - Dynamic Planner
-
-CeCe is the intelligent planning component that:
-
-- **Dynamic Planning** - Breaks complex tasks into executable steps
-- **Self-Healing** - Automatically recovers from failures
-- **Natural Memory** - Maintains context across conversations
-- **Issue Creator** - Generates GitHub issues from plans
-
-```python
-from cece import DynamicPlanner, SelfHealingOrchestrator
-
-planner = DynamicPlanner()
-plan = planner.create_plan("Deploy new feature to production")
-
-orchestrator = SelfHealingOrchestrator()
-result = orchestrator.execute(plan)
-```
-
-## Architecture
-
-```
-blackroad-agents/
-├── agent/
-│   ├── api.py          # FastAPI endpoints (864 lines)
-│   ├── telemetry.py    # Metrics collection (1,298 lines)
-│   ├── jobs.py         # Job scheduler (655 lines)
-│   ├── store.py        # State persistence (627 lines)
-│   ├── flash.py        # Fast operations (542 lines)
-│   ├── config.py       # Configuration (343 lines)
-│   ├── dashboard.py    # Monitoring UI (208 lines)
-│   └── discover.py     # Agent discovery (167 lines)
-├── cece/
-│   ├── dynamic_planner.py         # Plan generation
-│   ├── self_healing_orchestrator.py  # Failure recovery
-│   ├── natural_memory.py          # Context retention
-│   └── issue_creator.py           # GitHub integration
-├── Dockerfile
-└── railway.toml
-```
-
-## Configuration
-
-Environment variables:
-
-```bash
-# Redis for job queue (optional)
-REDIS_URL=redis://localhost:6379
-
-# Telemetry settings
-TELEMETRY_INTERVAL=30
-TELEMETRY_BATCH_SIZE=100
-
-# API settings
-API_HOST=0.0.0.0
-API_PORT=8000
-```
-
-## Deployment
-
-### Railway
-
-```bash
-railway login
-railway link
-railway up
-```
-
-### Docker Compose
-
-```yaml
-version: "3.8"
-services:
-  agents:
-    build: .
-    ports:
-      - "8000:8000"
-    environment:
-      - REDIS_URL=redis://redis:6379
-    depends_on:
-      - redis
-  redis:
-    image: redis:7-alpine
-```
-
-## License
-
-MIT - See [LICENSE](LICENSE) for details.
+- **Self-Healing Orchestrator**: `blackroad-os-agents/cece/self_healing_orchestrator.py`
+- **Dynamic Planner**: `blackroad-os-agents/cece/dynamic_planner.py`
+- **Agent Runtime**: `blackroad-os-agents/runtime/runtime.py`
+- **Agent API**: `blackroad-os-agents/runtime/api.py`
 
 ---
 
-Built by [BlackRoad OS](https://blackroad.io)
+**Do not create new issues or PRs here. Use the canonical repository above.**
+
+🖤 BlackRoad OS Consolidation - Phase 1
+
+---
+
+## 📜 License & Copyright
+
+**Copyright © 2026 BlackRoad OS, Inc. All Rights Reserved.**
+
+**CEO:** Alexa Amundson | **PROPRIETARY AND CONFIDENTIAL**
+
+This software is NOT for commercial resale. Testing purposes only.
+
+### 🏢 Enterprise Scale:
+- 30,000 AI Agents
+- 30,000 Human Employees
+- CEO: Alexa Amundson
+
+**Contact:** blackroad.systems@gmail.com
+
+See [LICENSE](LICENSE) for complete terms.
